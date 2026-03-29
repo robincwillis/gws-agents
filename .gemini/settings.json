@@ -1,0 +1,27 @@
+{
+  "general": {
+    "defaultApprovalMode": "auto_edit"
+  },
+  "tools": {
+    "allowed": [
+      "activate_skill",
+      "read_file",
+      "list_directory",
+      "glob",
+      "grep_search",
+      "web_fetch",
+      "google_web_search",
+      "replace",
+      "write_file",
+      "run_shell_command(ls)",
+      "run_shell_command(ls -R)",
+      "run_shell_command(pwd)",
+      "run_shell_command(git status)",
+      "run_shell_command(git log)",
+      "run_shell_command(id)",
+      "run_shell_command(whoami)",
+      "run_shell_command(git diff)",
+      "run_shell_command(git branch)"
+    ]
+  }
+}
