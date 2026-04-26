@@ -2,12 +2,39 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import threading
 import uuid
 from pathlib import Path
 from google.adk.agents import LlmAgent
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StreamableHTTPConnectionParams
+
+# ---------------------------------------------------------------------------
+# Colored tool-call logging
+# ---------------------------------------------------------------------------
+
+_CYAN   = "\033[96m"
+_YELLOW = "\033[93m"
+_GREEN  = "\033[92m"
+_RED    = "\033[91m"
+_DIM    = "\033[2m"
+_RESET  = "\033[0m"
+
+def _before_tool(tool, args, tool_context):
+    name = getattr(tool, "name", str(tool))
+    args_str = json.dumps(args, default=str)
+    print(f"\n{_CYAN}[tool call]{_RESET} {_YELLOW}{name}{_RESET} {_DIM}{args_str}{_RESET}", file=sys.stderr, flush=True)
+
+def _after_tool(tool, args, tool_context, tool_response):
+    name = getattr(tool, "name", str(tool))
+    preview = str(tool_response)
+    is_error = preview.lstrip().startswith("Error")
+    color = _RED if is_error else _GREEN
+    tag = "[tool error]" if is_error else "[tool done]"
+    if len(preview) > 200:
+        preview = preview[:200] + "…"
+    print(f"{color}{tag}{_RESET} {_YELLOW}{name}{_RESET} {_DIM}{preview}{_RESET}", file=sys.stderr, flush=True)
 
 def _skill(name: str) -> str:
     return (Path(__file__).parent / "skills" / f"{name}.md").read_text()
@@ -32,7 +59,15 @@ def gws_cli(command: str) -> str:
     """
     full_cmd = command if command.startswith("gws ") else f"gws {command}"
     result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True)
-    output = result.stdout if result.returncode == 0 else f"Error: {result.stderr}"
+    if result.returncode == 0:
+        output = result.stdout
+    else:
+        parts = [f"Error (exit {result.returncode}):"]
+        if result.stderr.strip():
+            parts.append(result.stderr.strip())
+        if result.stdout.strip():
+            parts.append(result.stdout.strip())
+        output = "\n".join(parts)
     if len(output) > _MAX_OUTPUT_BYTES:
         output = output[:_MAX_OUTPUT_BYTES] + f"\n[TRUNCATED — output exceeded {_MAX_OUTPUT_BYTES} bytes. Use smaller maxResults or --fields to reduce response size.]"
     return output
@@ -66,14 +101,17 @@ def archive_gmail_attachment(message_id: str, attachment_id: str, filename: str,
     """
     os.makedirs(dest_dir, exist_ok=True)
     dest_path = os.path.join(dest_dir, filename)
-    quoted_dest = shlex.quote(dest_path)
+    # repr() produces a valid Python string literal regardless of path content.
+    # shlex.quote() is for shell context only — paths with no special chars come
+    # back unquoted and break the python -c source code.
+    py_dest = repr(dest_path)
     job_id = uuid.uuid4().hex[:8]
     cmd = (
         f"gws gmail users messages attachments get "
         f'--params \'{{"userId":"me","messageId":"{message_id}","id":"{attachment_id}"}}\' '
         f"| python3 -c \""
         f"import sys,json,base64; d=json.load(sys.stdin); "
-        f"open({quoted_dest!r},'wb').write(base64.urlsafe_b64decode(d['data']+'=='))"
+        f"open({py_dest},'wb').write(base64.urlsafe_b64decode(d['data']+'=='))"
         f"\""
     )
     _jobs[job_id] = {"status": "running", "dest": dest_path, "error": ""}
@@ -138,12 +176,16 @@ docs_toolset = McpToolset(
 archive_tools = [archive_gmail_attachment, archive_drive_file, check_archive_job]
 workspace_tools = [gws_cli, docs_toolset]
 
+_callbacks = dict(before_tool_callback=_before_tool, after_tool_callback=_after_tool)
+
 sentinel = LlmAgent(
     model='gemini-3-flash-preview',
     name='storage_sentinel',
     description='Identify large files/attachments, download them, and queue for deletion.',
     instruction=_skill("sentinel"),
-    tools=workspace_tools + archive_tools
+    tools=workspace_tools + archive_tools,
+    output_key="sentinel_progress",
+    **_callbacks
 )
 
 auction = LlmAgent(
@@ -151,7 +193,9 @@ auction = LlmAgent(
     name='auction_intelligence',
     description='Scrape pricing data from auction emails and save to JSON/CSV.',
     instruction=_skill("auction"),
-    tools=workspace_tools
+    tools=workspace_tools,
+    output_key="auction_progress",
+    **_callbacks
 )
 
 gardener = LlmAgent(
@@ -159,7 +203,9 @@ gardener = LlmAgent(
     name='inbox_gardener',
     description='Mass-unsubscribe and triage emails.',
     instruction=_skill("gardener"),
-    tools=workspace_tools
+    tools=workspace_tools,
+    output_key="gardener_progress",
+    **_callbacks
 )
 
 architect = LlmAgent(
@@ -167,13 +213,52 @@ architect = LlmAgent(
     name='drive_architect',
     description='Audit and reorganize the Google Drive "Root" folder.',
     instruction=_skill("architect"),
-    tools=workspace_tools + archive_tools
+    tools=workspace_tools + archive_tools,
+    output_key="architect_progress",
+    **_callbacks
 )
+
+organizer = LlmAgent(
+    model='gemini-3.1-pro-preview',
+    name='content_organizer',
+    description='Crawl Drive folders and docs, propose a directory taxonomy, tag files with Drive properties, and flag empty or artifact files for deletion.',
+    instruction=_skill("organizer"),
+    tools=workspace_tools,
+    output_key="organizer_progress",
+    **_callbacks
+)
+
+_ROOT_INSTRUCTION = """\
+You are the orchestrator for a suite of Google Workspace agents.
+
+## Routing
+Delegate to the appropriate sub-agent:
+- storage_sentinel   — find and archive large Gmail attachments
+- auction_intelligence — extract bid data from auction emails
+- inbox_gardener     — unsubscribe and triage inbox
+- drive_architect    — audit and reorganize Drive root folder
+- content_organizer  — crawl all Drive folders, propose taxonomy, tag files, flag artifacts
+
+## Agent Loop — CRITICAL
+Every sub-agent ends its response with a JSON progress report:
+```json
+{"status": "complete|incomplete", "processed": N, "target": M, "next_page_token": "..."|null, "summary": "..."}
+```
+
+After each sub-agent returns, read its progress report and apply this logic:
+
+1. If `status` is `"complete"` or `processed >= target`: the task is done. Summarize results to the user.
+2. If `status` is `"incomplete"` and `processed < target`: re-delegate to the **same sub-agent** with a continuation message:
+   > "Continue. Already processed: <processed>. Resume from page token: <next_page_token>. Target: <target>."
+   Repeat until complete or the user cancels.
+3. If the sub-agent reports an error 3 times in a row on the same step: stop and surface the error to the user with full details. Do NOT loop indefinitely.
+
+"""
 
 root_agent = LlmAgent(
     model='gemini-3.1-pro-preview',
     name='root_agent',
     description='Multi-agent suite for Google Workspace management.',
-    instruction='You are the orchestrator for a suite of Google Workspace agents. Delegate tasks to the Storage Sentinel, Auction Intelligence, Inbox Gardener, or Drive Architect based on the user request.',
-    sub_agents=[sentinel, auction, gardener, architect]
+    instruction=_ROOT_INSTRUCTION,
+    sub_agents=[sentinel, auction, gardener, architect, organizer]
 )
