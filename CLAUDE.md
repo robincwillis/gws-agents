@@ -5,10 +5,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Running the Suite
 
 ```bash
-adk run workspace_agents
+adk run workspace_agents --use_local_storage
 ```
 
-Requires both `gws` (Google Workspace CLI) and `adk` (Agent Development Kit) installed and authenticated. Set your API key in `workspace_agents/.env`:
+`--use_local_storage` persists sessions to `.adk/` (already gitignored) so interrupted runs can be resumed. On restart, ADK automatically reloads the previous session — no extra flags needed.
+
+To start a fresh session, delete `.adk/` or pass `--session_service_uri memory://` to force in-memory.
+
+Requires both `gws` (Google Workspace CLI) and `adk` (Agent Development Kit) installed and authenticated. Set your API key in `.env` at the repo root (see `.env.example`):
 
 ```
 GOOGLE_GENAI_USE_VERTEXAI=0
@@ -33,6 +37,12 @@ This is a Python multi-agent system using Google's Agent Development Kit (ADK) w
 
 **Safety pattern:** Destructive operations (file deletion, Drive moves) are two-phase — agents generate a manifest/plan first and wait for explicit user confirmation before executing.
 
-**Agent system prompts** live in `workspace_agents/skills/` as Markdown files (one per agent).
+**Agent system prompts** live in `workspace_agents/skills/` as Markdown files (one per agent — `architect.md`, `auction.md`, `gardener.md`, `organizer.md`, `sentinel.md`).
 
-**Skill dependencies** (58 `gws` skills) are locked in `skills-lock.json`.
+**gws skill packs** (`gws-*/`, `persona-*/`, `recipe-*/` subdirectories of `workspace_agents/skills/`) are not committed. Install/refresh them with:
+
+```bash
+cd workspace_agents && gws generate-skills
+```
+
+`prompt_builder.py` composes each agent's full system prompt by concatenating its base `.md` file with the relevant `gws-*/SKILL.md` reference packs (see `SKILLS_MAP`).

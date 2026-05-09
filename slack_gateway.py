@@ -15,7 +15,7 @@ Setup:
        app_mention (channel @mentions)
   5. Install to Workspace → copy Bot User OAuth Token
      → this is your SLACK_BOT_TOKEN (xoxb-...)
-  6. Add to workspace_agents/.env:
+  6. Add to .env (at the repo root):
        SLACK_BOT_TOKEN=xoxb-...
        SLACK_APP_TOKEN=xapp-...
 
@@ -39,7 +39,7 @@ from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 
-load_dotenv("workspace_agents/.env")
+load_dotenv()
 
 ADK_BASE = os.getenv("ADK_BASE_URL", "http://127.0.0.1:8000")
 APP_NAME = "workspace_agents"

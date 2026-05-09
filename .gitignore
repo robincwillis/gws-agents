@@ -210,5 +210,15 @@ __marimo__/
 # OS
 .DS_Store
 
-# ADK
-.adk/*
+# ADK session storage (created by `adk run --use_local_storage`)
+.adk/
+**/.adk/
+
+# Generated gws CLI skills — installed via `gws generate-skills`, not version-controlled
+workspace_agents/skills/gws-*/
+workspace_agents/skills/persona-*/
+workspace_agents/skills/recipe-*/
+workspace_agents/docs/skills.md
+
+# Claude Code skill cache — installed locally, not version-controlled
+.claude/skills/

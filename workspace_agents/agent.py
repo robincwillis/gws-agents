@@ -1,14 +1,19 @@
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import threading
 import uuid
 from pathlib import Path
+
+# Force immediate exit on Ctrl+C — asyncio swallows KeyboardInterrupt mid-request
+signal.signal(signal.SIGINT, lambda _sig, _frame: os._exit(0))
 from google.adk.agents import LlmAgent
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StreamableHTTPConnectionParams
+from prompt_builder import build_skill
 
 # ---------------------------------------------------------------------------
 # Colored tool-call logging
@@ -21,7 +26,43 @@ _RED    = "\033[91m"
 _DIM    = "\033[2m"
 _RESET  = "\033[0m"
 
+# ---------------------------------------------------------------------------
+# Thinking spinner — runs in a background thread while the model is working
+# ---------------------------------------------------------------------------
+
+_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+_spinner_stop  = threading.Event()
+_spinner_thread: threading.Thread | None = None
+
+def _spin(agent_name: str) -> None:
+    i = 0
+    while not _spinner_stop.is_set():
+        frame = _SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]
+        print(f"\r{_CYAN}{frame}{_RESET} {_DIM}{agent_name} thinking…{_RESET}",
+              end="", file=sys.stderr, flush=True)
+        _spinner_stop.wait(0.1)
+        i += 1
+    # Clear the spinner line when done
+    print(f"\r{' ' * 40}\r", end="", file=sys.stderr, flush=True)
+
+def _before_model(callback_context, llm_request):
+    global _spinner_thread
+    _spinner_stop.clear()
+    _spinner_thread = threading.Thread(
+        target=_spin, args=(callback_context.agent_name,), daemon=True
+    )
+    _spinner_thread.start()
+
+def _after_model(callback_context, llm_response):
+    _spinner_stop.set()
+    if _spinner_thread:
+        _spinner_thread.join(timeout=0.5)
+
 def _before_tool(tool, args, tool_context):
+    # Stop spinner before printing tool call (tool calls happen mid-turn)
+    _spinner_stop.set()
+    if _spinner_thread:
+        _spinner_thread.join(timeout=0.5)
     name = getattr(tool, "name", str(tool))
     args_str = json.dumps(args, default=str)
     print(f"\n{_CYAN}[tool call]{_RESET} {_YELLOW}{name}{_RESET} {_DIM}{args_str}{_RESET}", file=sys.stderr, flush=True)
@@ -35,9 +76,6 @@ def _after_tool(tool, args, tool_context, tool_response):
     if len(preview) > 200:
         preview = preview[:200] + "…"
     print(f"{color}{tag}{_RESET} {_YELLOW}{name}{_RESET} {_DIM}{preview}{_RESET}", file=sys.stderr, flush=True)
-
-def _skill(name: str) -> str:
-    return (Path(__file__).parent / "skills" / f"{name}.md").read_text()
 
 def _token() -> str:
     raw = json.loads((Path.home() / ".gemini" / "oauth_creds.json").read_text())
@@ -176,13 +214,18 @@ docs_toolset = McpToolset(
 archive_tools = [archive_gmail_attachment, archive_drive_file, check_archive_job]
 workspace_tools = [gws_cli, docs_toolset]
 
-_callbacks = dict(before_tool_callback=_before_tool, after_tool_callback=_after_tool)
+_callbacks = dict(
+    before_model_callback=_before_model,
+    after_model_callback=_after_model,
+    before_tool_callback=_before_tool,
+    after_tool_callback=_after_tool,
+)
 
 sentinel = LlmAgent(
     model='gemini-3-flash-preview',
     name='storage_sentinel',
     description='Identify large files/attachments, download them, and queue for deletion.',
-    instruction=_skill("sentinel"),
+    instruction=build_skill("sentinel"),
     tools=workspace_tools + archive_tools,
     output_key="sentinel_progress",
     **_callbacks
@@ -192,7 +235,7 @@ auction = LlmAgent(
     model='gemini-3-flash-preview',
     name='auction_intelligence',
     description='Scrape pricing data from auction emails and save to JSON/CSV.',
-    instruction=_skill("auction"),
+    instruction=build_skill("auction"),
     tools=workspace_tools,
     output_key="auction_progress",
     **_callbacks
@@ -202,7 +245,7 @@ gardener = LlmAgent(
     model='gemini-3-flash-preview',
     name='inbox_gardener',
     description='Mass-unsubscribe and triage emails.',
-    instruction=_skill("gardener"),
+    instruction=build_skill("gardener"),
     tools=workspace_tools,
     output_key="gardener_progress",
     **_callbacks
@@ -212,7 +255,7 @@ architect = LlmAgent(
     model='gemini-3.1-pro-preview',
     name='drive_architect',
     description='Audit and reorganize the Google Drive "Root" folder.',
-    instruction=_skill("architect"),
+    instruction=build_skill("architect"),
     tools=workspace_tools + archive_tools,
     output_key="architect_progress",
     **_callbacks
@@ -222,7 +265,7 @@ organizer = LlmAgent(
     model='gemini-3.1-pro-preview',
     name='content_organizer',
     description='Crawl Drive folders and docs, propose a directory taxonomy, tag files with Drive properties, and flag empty or artifact files for deletion.',
-    instruction=_skill("organizer"),
+    instruction=build_skill("organizer"),
     tools=workspace_tools,
     output_key="organizer_progress",
     **_callbacks
@@ -250,8 +293,8 @@ After each sub-agent returns, read its progress report and apply this logic:
 1. If `status` is `"complete"` or `processed >= target`: the task is done. Summarize results to the user.
 2. If `status` is `"incomplete"` and `processed < target`: re-delegate to the **same sub-agent** with a continuation message:
    > "Continue. Already processed: <processed>. Resume from page token: <next_page_token>. Target: <target>."
-   Repeat until complete or the user cancels.
 3. If the sub-agent reports an error 3 times in a row on the same step: stop and surface the error to the user with full details. Do NOT loop indefinitely.
+4. **Hard cap: stop after 25 re-delegations per user request.** If the task is still incomplete, report what was accomplished so far and tell the user to re-run to continue. This prevents runaway loops.
 
 """
 
