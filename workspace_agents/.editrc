@@ -1,0 +1,20 @@
+# libedit config for this project only — loaded explicitly by agent.py via
+# readline.read_init_file(), not the global ~/.editrc. Used by Python's
+# `readline` module (adk run's interactive REPL uses plain input()).
+#
+# Goal: Option+Left/Right moves by word, matching Claude Code CLI and
+# most modern terminal apps.
+
+# Option+Left / Option+Right when the terminal sends the xterm CSI form
+# (default in iTerm2/Terminal.app with "Option as Meta key" off)
+bind "\e[1;3D" ed-prev-word
+bind "\e[1;3C" em-next-word
+
+# Option+Left / Option+Right when the terminal sends classic Meta-b/Meta-f
+# (default emacs bindings already, kept explicit for safety)
+bind "\eb" ed-prev-word
+bind "\ef" em-next-word
+
+# Option+Delete / Option+Backspace: delete a whole word
+bind "\e[3;3~" em-delete-next-word
+bind "\e\177" ed-delete-prev-word

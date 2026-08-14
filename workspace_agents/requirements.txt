@@ -1,2 +1,4 @@
-google-adk
+google-adk[mcp]
 python-dotenv
+httpx
+slack_sdk

@@ -1,5 +1,6 @@
 import json
 import os
+import readline
 import shlex
 import signal
 import subprocess
@@ -10,10 +11,19 @@ from pathlib import Path
 
 # Force immediate exit on Ctrl+C — asyncio swallows KeyboardInterrupt mid-request
 signal.signal(signal.SIGINT, lambda _sig, _frame: os._exit(0))
+
+# Project-scoped line-editing bindings (Option+Arrow word navigation, etc.)
+# for `adk run`'s interactive prompt — loaded explicitly here instead of via
+# the global ~/.editrc, so it only applies to this project's sessions.
+readline.read_init_file(str(Path(__file__).with_name(".editrc")))
+
 from google.adk.agents import LlmAgent
+from google.adk.apps.app import App, EventsCompactionConfig
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StreamableHTTPConnectionParams
-from prompt_builder import build_skill
+from .diagnostics import DIAGNOSTIC_TOOLS
+from .prompt_builder import build_skill
+from .resilience import WorkspaceAgentsResiliencePlugin
 
 # ---------------------------------------------------------------------------
 # Colored tool-call logging
@@ -77,10 +87,6 @@ def _after_tool(tool, args, tool_context, tool_response):
         preview = preview[:200] + "…"
     print(f"{color}{tag}{_RESET} {_YELLOW}{name}{_RESET} {_DIM}{preview}{_RESET}", file=sys.stderr, flush=True)
 
-def _token() -> str:
-    raw = json.loads((Path.home() / ".gemini" / "oauth_creds.json").read_text())
-    return raw.get("access_token", "")
-
 _MAX_OUTPUT_BYTES = 32_000
 _DEFAULT_ARCHIVE_DIR = str(Path.home() / "archive")
 _jobs: dict[str, dict] = {}
@@ -88,6 +94,14 @@ _jobs: dict[str, dict] = {}
 # ---------------------------------------------------------------------------
 # Core execution tool
 # ---------------------------------------------------------------------------
+
+_AUTH_EXPIRED_MARKERS = (
+    "invalid_grant",
+    "Token has been expired or revoked",
+    '"code": 401',
+    "Authentication failed",
+)
+
 
 def gws_cli(command: str) -> str:
     """Execute a Google Workspace CLI (gws) command and return the output.
@@ -100,6 +114,15 @@ def gws_cli(command: str) -> str:
     if result.returncode == 0:
         output = result.stdout
     else:
+        combined = (result.stderr or "") + "\n" + (result.stdout or "")
+        if any(marker in combined for marker in _AUTH_EXPIRED_MARKERS):
+            return (
+                "AUTH_EXPIRED — the Google Workspace CLI OAuth token is expired or revoked. "
+                "STOP. Do not retry this or any other gws command. "
+                "Reply to the user with exactly: "
+                "\"Your gws auth token has expired. Please run `gws auth login` in a terminal, "
+                "then ask me to continue.\""
+            )
         parts = [f"Error (exit {result.returncode}):"]
         if result.stderr.strip():
             parts.append(result.stderr.strip())
@@ -205,7 +228,6 @@ def check_archive_job(job_id: str) -> str:
 docs_toolset = McpToolset(
     connection_params=StreamableHTTPConnectionParams(
         url="https://workspace-developer.goog/mcp",
-        headers={"Authorization": f"Bearer {_token()}"},
         timeout=30.0,
         sse_read_timeout=300.0,
     )
@@ -271,6 +293,20 @@ organizer = LlmAgent(
     **_callbacks
 )
 
+# system_diagnostics intentionally does NOT include docs_toolset in its tools.
+# If the workspace-developer MCP is broken, we want the diagnostic agent to
+# still be invokable and to report that as a FAIL row — not to itself 500
+# during request preprocessing because ADK couldn't list the toolset.
+system_diagnostics = LlmAgent(
+    model='gemini-3-flash-preview',
+    name='system_diagnostics',
+    description='Run health checks on every upstream system (gws auth, workspace-developer MCP, Gemini API key, OAuth creds, session storage, Slack tokens) and report which are operational.',
+    instruction=build_skill("diagnostics"),
+    tools=DIAGNOSTIC_TOOLS,
+    output_key="diagnostics_progress",
+    **_callbacks
+)
+
 _ROOT_INSTRUCTION = """\
 You are the orchestrator for a suite of Google Workspace agents.
 
@@ -281,6 +317,7 @@ Delegate to the appropriate sub-agent:
 - inbox_gardener     — unsubscribe and triage inbox
 - drive_architect    — audit and reorganize Drive root folder
 - content_organizer  — crawl all Drive folders, propose taxonomy, tag files, flag artifacts
+- system_diagnostics — verify upstream systems are operational (gws auth, MCP, API keys, session storage). Route here for "health check", "status", "is everything working", "test the systems", or any debugging of why other agents are failing.
 
 ## Agent Loop — CRITICAL
 Every sub-agent ends its response with a JSON progress report:
@@ -303,5 +340,23 @@ root_agent = LlmAgent(
     name='root_agent',
     description='Multi-agent suite for Google Workspace management.',
     instruction=_ROOT_INSTRUCTION,
-    sub_agents=[sentinel, auction, gardener, architect, organizer]
+    sub_agents=[sentinel, auction, gardener, architect, organizer, system_diagnostics]
+)
+
+# App wrapper: adds context compaction (guards against exceeding the model's
+# ~1M-token context window on long runs, e.g. inbox_gardener processing
+# hundreds of emails) and a resilience plugin (model/tool errors are reported
+# to the user instead of crashing the `adk run` session). `adk run` and
+# `adk web` look for `app` before falling back to `root_agent`.
+app = App(
+    name='workspace_agents',
+    root_agent=root_agent,
+    events_compaction_config=EventsCompactionConfig(
+        # Compact once the last-observed prompt hits this many tokens, well
+        # under the ~1,048,576 hard ceiling, keeping the most recent events
+        # uncompacted for continuity.
+        token_threshold=400_000,
+        event_retention_size=20,
+    ),
+    plugins=[WorkspaceAgentsResiliencePlugin()],
 )

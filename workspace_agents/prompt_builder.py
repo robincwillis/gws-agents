@@ -34,6 +34,45 @@ Use it directly — do not run `--help` or `schema` for operations listed there.
 `mcp_workspace-developer_search_workspace_docs`.
 """
 
+# Output formatting rules — prepended to every agent's system prompt.
+# Responses are rendered in both Slack mrkdwn and a plain terminal. Neither
+# renders standard markdown tables or `## headings`, and Slack treats `**bold**`
+# as literal asterisks. The rules below produce text that looks decent in both.
+_OUTPUT_FORMAT_GUIDE = """\
+## Output Formatting — read carefully
+
+Your responses are shown in **two surfaces simultaneously**: a plain terminal \
+(no markdown rendering) and Slack (limited mrkdwn — no markdown tables, no \
+`## headings`, and `**double asterisks**` are shown as literal characters). \
+Follow these rules so your output looks decent in both:
+
+- **Bold:** use `*bold*` (single asterisks). Never `**bold**`.
+- **Headings:** use a bare `*Heading:*` line. Never `#`, `##`, or `###`.
+- **Tables:** never use markdown pipe tables. Render ASCII tables (space- or \
+pipe-padded columns) inside a triple-backtick fence — both surfaces render \
+fences as monospace blocks.
+- **JSON:** always pretty-print with 2-space indent, inside ```json fences. \
+Never inline minified JSON in prose.
+- **Lists:** use `-` or `•` prefixes — both render in both surfaces.
+- **Code, paths, IDs, flags:** wrap in single backticks.
+- **No ANSI escape codes** in response text — they show as garbage in Slack.
+- **No emoji** unless the user asked for them.
+
+Example of a good results table:
+
+```
+File                          Size    Modified
+----------------------------  ------  ----------
+2024-Q3-financials.xlsx       18 MB   2024-10-02
+quarterly-report.pdf          12 MB   2024-09-30
+```
+"""
+
+
+def _wrap_with_format_guide(prompt: str) -> str:
+    """Prepend the universal output-format guide to an agent prompt."""
+    return f"{_OUTPUT_FORMAT_GUIDE}\n---\n\n{prompt}"
+
 _DISCOVERY_RE = re.compile(
     r"## Command Discovery.*?(?=\n## )",
     re.DOTALL,
@@ -65,10 +104,10 @@ def build_skill(name: str) -> str:
 
     gws_skills = SKILLS_MAP.get(name, [])
     if not gws_skills:
-        return composed
+        return _wrap_with_format_guide(composed)
 
     parts = [composed, "\n---\n\n## Embedded gws Command Reference\n"]
     for skill_name in gws_skills:
         parts.append(_read_gws_skill(skill_name))
 
-    return "\n".join(parts)
+    return _wrap_with_format_guide("\n".join(parts))

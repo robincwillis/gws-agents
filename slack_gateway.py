@@ -20,8 +20,8 @@ Setup:
        SLACK_APP_TOKEN=xapp-...
 
 Run (two terminals):
-  Terminal 1:  adk api_server workspace_agents
-  Terminal 2:  python slack_gateway.py
+  Terminal 1:  uv run adk api_server workspace_agents
+  Terminal 2:  uv run python slack_gateway.py
 
 Commands (send as a DM to the bot):
   /reset   — start a new conversation session
@@ -29,6 +29,7 @@ Commands (send as a DM to the bot):
 
 import json
 import os
+import re
 import uuid
 from threading import Event
 
@@ -43,21 +44,35 @@ load_dotenv()
 
 ADK_BASE = os.getenv("ADK_BASE_URL", "http://127.0.0.1:8000")
 APP_NAME = "workspace_agents"
-SLACK_MAX_CHARS = 3000  # safe Slack message length
+# Slack hard limit per chat.update is ~40k chars. 12k keeps responses readable
+# without dropping much; long agent outputs over this still get truncated, but
+# the truncation now closes any open ``` fence so tables don't render broken.
+SLACK_MAX_CHARS = 12000
 
 # Slack user_id → ADK session_id (in-memory; resets on gateway restart)
 _sessions: dict[str, str] = {}
+
+# Bounded LRU for Slack event_ids we've already handled. Socket Mode occasionally
+# redelivers the same event after transient hiccups (or after our handler
+# returned an error to ADK on the first pass). Dedupe so the user doesn't see
+# two replies — one error and one success — for a single message.
+_seen_event_ids: dict[str, None] = {}
+_SEEN_LIMIT = 256
 
 
 def _ensure_session(user_id: str) -> str:
     if user_id not in _sessions:
         session_id = uuid.uuid4().hex
-        _sessions[user_id] = session_id
-        httpx.post(
+        resp = httpx.post(
             f"{ADK_BASE}/apps/{APP_NAME}/users/{user_id}/sessions/{session_id}",
             json={},
             timeout=10,
         )
+        resp.raise_for_status()
+        # Only cache once the server has confirmed the session exists — caching
+        # optimistically here would leave a dead session_id in _sessions forever
+        # (never re-created) if this request failed.
+        _sessions[user_id] = session_id
     return _sessions[user_id]
 
 
@@ -65,9 +80,8 @@ def _reset_session(user_id: str) -> None:
     _sessions.pop(user_id, None)
 
 
-def _run_agent(user_id: str, text: str) -> str:
-    session_id = _ensure_session(user_id)
-    resp = httpx.post(
+def _post_run(user_id: str, session_id: str, text: str) -> httpx.Response:
+    return httpx.post(
         f"{ADK_BASE}/run",
         json={
             "app_name": APP_NAME,
@@ -77,6 +91,19 @@ def _run_agent(user_id: str, text: str) -> str:
         },
         timeout=300,  # workspace ops can be slow
     )
+
+
+def _run_agent(user_id: str, text: str) -> str:
+    session_id = _ensure_session(user_id)
+    resp = _post_run(user_id, session_id, text)
+    if resp.status_code == 404:
+        # The cached session_id is gone server-side (e.g. api_server was
+        # restarted with a different/fresh session store since we created it).
+        # Recreate the session and retry once instead of 404ing on every
+        # message from this user until the gateway itself is restarted.
+        _reset_session(user_id)
+        session_id = _ensure_session(user_id)
+        resp = _post_run(user_id, session_id, text)
     resp.raise_for_status()
     for event in reversed(resp.json()):
         content = event.get("content", {})
@@ -88,15 +115,91 @@ def _run_agent(user_id: str, text: str) -> str:
     return "(no response)"
 
 
+# ── Slack mrkdwn sanitizer ────────────────────────────────────────────────
+# The agent's system prompt steers it toward Slack/terminal-friendly output,
+# but LLMs slip occasionally. These transforms catch the common slips so the
+# user sees rendered formatting instead of literal `**asterisks**` and broken
+# `| pipe | tables |`.
+
+_FENCE_OR_INLINE_CODE_RE = re.compile(r"(```[\s\S]*?```|`[^`\n]+`)")
+_BOLD_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+_MD_TABLE_RE = re.compile(
+    r"^\|[^\n]*\|[ \t]*\n"          # header row
+    r"^\|[\s\-:|]+\|[ \t]*\n"       # separator row of dashes/colons/pipes
+    r"(?:^\|[^\n]*\|[ \t]*\n?)+",   # one or more body rows
+    re.MULTILINE,
+)
+
+
+def _md_table_to_ascii(match: re.Match) -> str:
+    block = match.group(0).strip("\n")
+    rows = []
+    for ln in block.splitlines():
+        ln = ln.strip().strip("|")
+        if not ln:
+            continue
+        rows.append([c.strip() for c in ln.split("|")])
+    if len(rows) < 2:
+        return match.group(0)
+    is_separator = all(set(c) <= set("-:") for c in rows[1] if c)
+    header = rows[0]
+    body = rows[2:] if is_separator else rows[1:]
+    n_cols = len(header)
+    body = [(r + [""] * n_cols)[:n_cols] for r in body]
+    widths = [max(len(header[i]), *(len(r[i]) for r in body), 1) for i in range(n_cols)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    sep = "  ".join("-" * w for w in widths)
+    lines = [fmt.format(*header), sep] + [fmt.format(*r) for r in body]
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+def _sanitize_for_slack(text: str) -> str:
+    """Best-effort cleanup: rewrite markdown the LLM may have emitted into Slack mrkdwn."""
+    parts = _FENCE_OR_INLINE_CODE_RE.split(text)
+    # Even indices are prose, odd are code (preserved as-is).
+    for i in range(0, len(parts), 2):
+        seg = parts[i]
+        seg = _MD_TABLE_RE.sub(_md_table_to_ascii, seg)
+        seg = _BOLD_RE.sub(r"*\1*", seg)
+        seg = _HEADING_RE.sub(r"*\2*", seg)
+        parts[i] = seg
+    return "".join(parts)
+
+
 def _truncate(text: str) -> str:
     if len(text) <= SLACK_MAX_CHARS:
         return text
-    return text[: SLACK_MAX_CHARS - 40] + "\n\n_(response truncated — ask for more)_"
+    cut = text[: SLACK_MAX_CHARS - 60]
+    # If the cut lands inside an open ``` fence, close it so the truncation
+    # marker doesn't get swallowed into a code block (and the prose before it
+    # doesn't render as monospace).
+    if cut.count("```") % 2 == 1:
+        cut = cut.rstrip() + "\n```"
+    return cut + "\n\n_(response truncated — ask for more)_"
+
+
+def _seen(event_id: str | None) -> bool:
+    """Return True if event_id has been handled before; record it otherwise."""
+    if not event_id:
+        return False
+    if event_id in _seen_event_ids:
+        return True
+    _seen_event_ids[event_id] = None
+    if len(_seen_event_ids) > _SEEN_LIMIT:
+        # Drop the oldest entry — dict preserves insertion order.
+        _seen_event_ids.pop(next(iter(_seen_event_ids)))
+    return False
 
 
 def _handle(client: SocketModeClient, req: SocketModeRequest) -> None:
     # Acknowledge immediately to avoid Slack retries
     client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
+
+    # Slack Socket Mode can redeliver the same event after transient errors.
+    # Dedupe by event_id so a single user message never produces two replies.
+    if _seen(req.payload.get("event_id")):
+        return
 
     event = req.payload.get("event", {})
     event_type = event.get("type")
@@ -143,7 +246,7 @@ def _handle(client: SocketModeClient, req: SocketModeRequest) -> None:
     )
 
     try:
-        reply = _truncate(_run_agent(user_id, text))
+        reply = _truncate(_sanitize_for_slack(_run_agent(user_id, text)))
     except httpx.ConnectError:
         reply = "Cannot reach the ADK server — is `adk api_server workspace_agents` running?"
     except httpx.TimeoutException:
